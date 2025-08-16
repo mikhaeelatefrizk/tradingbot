@@ -16,12 +16,12 @@ class Spinner:
         sys.stdout.write(f'\r{next(self.spinner)} {text}')
         sys.stdout.flush()
 
-def run_git_command(command, check=True, show_spinner=True):
+def run_git_command(command, check=True, show_spinner=True, retry_count=0, max_retries=3):
     spinner = Spinner()
     try:
         print(f"\nExecuting: git {' '.join(command[1:])}")
         if show_spinner:
-            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             while process.poll() is None:
                 spinner.spin("Working...")
                 time.sleep(0.1)
@@ -33,13 +33,15 @@ def run_git_command(command, check=True, show_spinner=True):
         if result.returncode == 0:
             return result
         
-        # Auto-retry on push failures
-        if 'push' in command and result.returncode != 0:
-            print("\nPush failed, retrying...")
+        # Auto-retry on push failures with limit
+        if 'push' in command and result.returncode != 0 and retry_count < max_retries:
+            print(f"\nPush failed (attempt {retry_count + 1}/{max_retries + 1}), retrying...")
+            print(f"Error: {result.stderr}")
             time.sleep(2)
-            return run_git_command(command, check, show_spinner)
+            return run_git_command(command, check, show_spinner, retry_count + 1, max_retries)
             
-        print(f"\nWarning: {result.stderr}")
+        if result.stderr:
+            print(f"\nError/Warning: {result.stderr}")
         return result
     except subprocess.CalledProcessError as e:
         print(f"\nError: {e.stderr}")
@@ -52,12 +54,22 @@ def setup_git():
     # Initialize git if not already initialized
     if not Path('.git').exists():
         subprocess.run(['git', 'init'])
+        # Set default branch to main
+        subprocess.run(['git', 'config', 'init.defaultBranch', 'main'])
+        subprocess.run(['git', 'checkout', '-b', 'main'])
         # Add .gitignore if it doesn't exist
         if not Path('.gitignore').exists():
             Path('.gitignore').touch()
         # Force add all files including hidden ones
         subprocess.run(['git', 'add', '-f', '.'])
         subprocess.run(['git', 'commit', '-m', 'Initial commit'])
+    else:
+        # Check current branch and switch to main if needed
+        result = subprocess.run(['git', 'branch', '--show-current'], capture_output=True, text=True)
+        current_branch = result.stdout.strip()
+        if current_branch != 'main':
+            # Rename current branch to main
+            subprocess.run(['git', 'branch', '-M', 'main'])
 
 def check_repo_exists(username, repo_name, token):
     """Check if a GitHub repository exists"""
@@ -114,6 +126,37 @@ def get_github_credentials():
     
     return username, token
 
+def setup_git_credentials(username, token):
+    """Configure git credentials for GitHub authentication"""
+    # Configure git user info
+    run_git_command(['git', 'config', 'user.name', username])
+    run_git_command(['git', 'config', 'user.email', f'{username}@users.noreply.github.com'])
+    
+    # Configure credential helper
+    run_git_command(['git', 'config', 'credential.helper', 'store'])
+    
+    # Store credentials for this repository
+    credentials_file = Path.home() / '.git-credentials'
+    credential_line = f'https://{username}:{token}@github.com\n'
+    
+    # Read existing credentials
+    existing_credentials = []
+    if credentials_file.exists():
+        with open(credentials_file, 'r') as f:
+            existing_credentials = f.readlines()
+    
+    # Remove any existing GitHub credentials for this user
+    filtered_credentials = [line for line in existing_credentials if not line.startswith(f'https://{username}:') or 'github.com' not in line]
+    
+    # Add new credentials
+    filtered_credentials.append(credential_line)
+    
+    # Write back to file
+    with open(credentials_file, 'w') as f:
+        f.writelines(filtered_credentials)
+    
+    print(f"✅ Git credentials configured for {username}")
+
 def sync_with_github(username, repo_name, token):
     repo_url = f"https://github.com/{username}/{repo_name}.git"
     print(f"\nSynchronizing with {repo_url}")
@@ -135,8 +178,8 @@ def sync_with_github(username, repo_name, token):
     else:
         print(f"✅ Repository '{repo_name}' found!")
     
-    # Setup credential caching
-    run_git_command(['git', 'config', '--global', 'credential.helper', 'store'])
+    # Setup git credentials
+    setup_git_credentials(username, token)
     
     # Check if remote exists
     remote_exists = run_git_command(['git', 'remote', 'get-url', 'origin'], check=False)
@@ -153,14 +196,26 @@ def sync_with_github(username, repo_name, token):
     
     # Force add all files including hidden ones
     run_git_command(['git', 'add', '-f', '.'])
-    run_git_command(['git', 'commit', '-m', 'Update flashcards project'])
-    result = run_git_command(['git', 'push', '-u', 'origin', 'main', '--force'])
+    
+    # Check if there are changes to commit
+    status_result = run_git_command(['git', 'status', '--porcelain'], show_spinner=False)
+    if status_result and status_result.stdout.strip():
+        run_git_command(['git', 'commit', '-m', 'Update project files'])
+    
+    # Push to main branch
+    result = run_git_command(['git', 'push', '-u', 'origin', 'main'])
     
     if result and result.returncode == 0:
         print("\n🎉 Successfully synchronized with GitHub!")
         print(f"📂 Repository URL: https://github.com/{username}/{repo_name}")
     else:
-        print("\nSync completed with some warnings. Please check the messages above.")
+        print("\n❌ Sync failed. Please check the error messages above.")
+        if result and result.stderr:
+            print(f"Last error: {result.stderr}")
+            # Suggest manual fix
+            print(f"\n💡 You can try manually:")
+            print(f"   git remote add origin {repo_url}")
+            print(f"   git push -u origin main")
 
 if __name__ == '__main__':
     print("🚀 GitHub Repository Sync Tool")
@@ -177,6 +232,9 @@ if __name__ == '__main__':
         print("❌ Repository name cannot be empty!")
         sys.exit(1)
     
-    # Setup git and sync
+    # Setup git first
+    print("\n📁 Setting up local Git repository...")
     setup_git()
+    
+    # Then sync with GitHub
     sync_with_github(username, repo_name, token)
